@@ -1,0 +1,62 @@
+study_area:
+  name: Chennai
+  latitude: 13.08          # used for NASA POWER (the city location)
+  longitude: 80.27
+  region_type: coastal
+
+opencity:                  # primary temperature record
+  url: https://data.opencity.in/dataset/e57cd149-fd78-4853-80b8-47d3d082845e/resource/56df10c7-cd7e-4c7a-950c-96aec31a0e57/download/320fa3c6-0de0-42bc-a0ca-ac25666e8d55.csv
+  filename: chennai_opencity_daily.csv
+  date_format: "%d-%m-%Y"  # day-first, checked against the file
+  grid_lat: 13.5           # as stated on the dataset page (documentation only)
+  grid_lon: 80.5
+  station_from_year: 2021  # per the dataset page: IMD Nungambakkam station via Ogimet. Verify.
+  credit: "OpenCity (credit: Nikhil VJ); source: IMD (imd.gov.in); license per dataset page"
+
+period:
+  start_year: 1951
+  end_year: 2024
+
+analysis:
+  homogeneous_end_year: 2020   # EVT primary fit: grid-based years only
+  ml_start_year: 1981          # NASA POWER starts in 1981
+  ml_end_year: 2020            # keeps the station-based years out of ML evaluation
+
+paths:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  figures_dir: outputs/figures
+  tables_dir: outputs/tables
+  models_dir: models
+
+nasa_power:
+  community: AG
+  start_year: 1981
+  parameters: [T2M_MAX, T2M_MIN, RH2M, T2MDEW, WS2M]
+
+preprocessing:
+  max_missing_fraction: 0.05
+  plausible_ranges:
+    tmax: [10, 55]
+    tmin: [0, 40]
+    rain: [0, 1000]
+    power_tmax: [10, 55]
+    power_tmin: [0, 40]
+    rh2m: [0, 100]
+    dewpoint: [-10, 40]
+    wind: [0, 50]
+
+features:
+  base_columns: [tmax, tmin, rh2m, dewpoint, wind]
+  lag_columns: [tmax, tmin]
+  lag_days: [1, 2, 3]
+  rolling_windows: [3, 7]
+
+split:                     # provisional for 1981-2020; revisit once we count heatwave days
+  train_end_year: 2005
+  val_end_year: 2012
+
+forecast:
+  horizon_days: 1
+
+random_seed: 42
