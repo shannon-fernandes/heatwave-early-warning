@@ -1,0 +1,45 @@
+# Reference settings for the current Chennai heatwave research prototype.
+# IMPORTANT: app/streamlit_app.py does not load this file. Runtime settings
+# come from the dashboard sidebar and function defaults; editing this file
+# alone does not change dashboard behavior.
+
+data:
+  source: "NASA POWER daily historical data"
+  location: "Chennai, Tamil Nadu"
+  # Input values must be prepared by the user; there is no automatic download.
+  date_column: "date"
+  max_temperature_column: "max_temp_c"
+  departure_column: "departure_from_normal_c"
+  optional_weather_columns:
+    min_temperature: "min_temp_c"
+    humidity: "humidity"
+    wind_speed: "wind_speed"
+  # The dashboard does not calculate this field. Compute it upstream from a
+  # documented climatological reference before training.
+  departure_from_normal_required_for_training: true
+
+labels:
+  output_column: "heatwave_proxy"
+  max_temperature_threshold_c: 37.0
+  departure_threshold_c: 4.5
+  minimum_consecutive_days: 2
+  # Simplified IMD-style coastal research proxy, not an official IMD
+  # declaration; spatial declaration requirements are not implemented.
+
+features:
+  lag_days: [1, 2, 3, 7]
+  rolling_windows: [3, 7]
+  # Rolling Tmax summaries use preceding calendar days only and exclude the
+  # target date. Missing dates and values remain missing in generated features.
+  calendar_features: ["month", "day_of_year"]
+
+training:
+  train_fraction: 0.8
+  minimum_validation_positive_cases: 5
+  split: "chronological"
+  classifier: "LogisticRegression"
+  class_weight: "balanced"
+  max_iterations: 1000
+  random_state: 0
+  imputation: "median, fitted on training rows only"
+  scaling: "StandardScaler, fitted on training rows only"

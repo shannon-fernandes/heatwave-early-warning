@@ -1,207 +1,210 @@
-# Heatwave and Extreme Temperature Early Warning System for India
+# Chennai Heatwave Early Warning System
 
-Extreme Value Theory (GEV) and machine learning, with Chennai as the study area.
+A research prototype for exploring daily temperature extremes and a
+one-day-ahead heatwave proxy classifier for Chennai, Tamil Nadu. The current
+workflow accepts user-prepared NASA POWER daily historical data. It does not
+download data automatically, query a live weather service, or provide
+operational warnings.
 
-> **Research prototype.** This is an academic project. It is **not** an
-> operational, official, or government-endorsed warning service. Heatwave labels
-> are an **IMD-style proxy**, not official IMD declarations. Safety text is
-> general guidance only. For real alerts, follow the India Meteorological
-> Department (IMD) and local authorities.
+> **Research prototype only.** The positive target is a simplified coastal
+> heatwave proxy, not an official India Meteorological Department (IMD)
+> declaration. Spatial requirements for official declarations are not
+> implemented. For real alerts, follow IMD and local authorities.
 
-## Problem statement
+## Current architecture
 
-Heatwaves cause heat-related illness and deaths and strain power and water
-systems. Early warning needs (a) an estimate of how rare an extreme temperature
-is and (b) a forecast of heatwave days before they happen. This project combines
-Extreme Value Theory for (a) with a machine learning classifier for (b).
+```text
+User-prepared NASA POWER daily CSV
+              |
+              v
+app/streamlit_app.py -- validates upload and exposes explicit controls
+       |                         |
+       v                         v
+src/heatwave_labels.py     src/feature_engineering.py
+       |                         |
+       +------> src/train_model.py <------+
+                         |
+                         v
+                 src/predict_warning.py
+```
 
-## Research questions
+- `app/streamlit_app.py` validates a user-uploaded CSV, displays uploaded
+  history, trains on button click, presents a chronological validation, and
+  allows selected-date inference. It retains results in Streamlit session
+  state so ordinary page reruns do not retrain.
+- `src/heatwave_labels.py` assigns nullable research proxy labels. A known day
+  qualifies when Tmax is at least 37 °C and departure from normal is at least
+  4.5 °C. The default persistence is two consecutive calendar days.
+- `src/feature_engineering.py` creates calendar-day lags, prior-calendar-day
+  Tmax rolling means/maxima, month, and day of year. Missing days or readings
+  remain missing; no weather values are fabricated.
+- `src/train_model.py` uses those labels and predictors in a chronological
+  split, fitting a median imputer, scaler, and class-balanced Logistic
+  Regression pipeline on training rows only. It returns validation metrics
+  and an in-memory model; it does not save a model.
+- `src/predict_warning.py` uses the same feature builder for a selected date,
+  checks the model feature schema, and excludes target-day readings from
+  predictors.
 
-1. **EVT:** What are the 2-, 5-, 10- and 20-year return levels of annual maximum
-   temperature in Chennai, and how uncertain are they?
-2. **Trend:** Is there evidence that extremes are changing, making a stationary
-   GEV questionable?
-3. **ML:** Can a leakage-safe, interpretable classifier forecast a heatwave day
-   one day ahead better than climatology and persistence baselines?
-4. **Warning:** Can calibrated probabilities and cost-aware thresholds be turned
-   into understandable risk levels?
+`config/config.yaml` documents current code defaults for reference. The
+dashboard does **not** load that file: its settings are the explicit sidebar
+controls in `app/streamlit_app.py`. Change the app controls or code to change
+runtime behavior; editing YAML alone has no effect.
 
-## Study area and period
+## Dataset and CSV schema
 
-- Location: Chennai, Tamil Nadu (about 13.08 N, 80.27 E), a coastal station
-- Period: 1981 to the latest full year (EVT may use the longer IMD record)
-- Both settings live in `config/config.yaml`, so the location and years can be
-  changed without editing code
+The selected source remains **NASA POWER daily historical weather data for
+Chennai**. The dashboard expects a CSV with one row per calendar day:
 
-## Data sources
+| Column | Required | Meaning |
+|---|---:|---|
+| `date` | Yes | Daily observation date, parseable as a calendar date |
+| `max_temp_c` | Yes | Daily maximum temperature in °C |
+| `departure_from_normal_c` | Yes for training | Tmax departure from normal in °C |
+| `min_temp_c` | No | Daily minimum temperature; numeric when present |
+| `humidity` | No | Daily humidity; numeric when present |
+| `wind_speed` | No | Daily wind speed; numeric when present |
 
-| Dataset | Role | Access |
-|---|---|---|
-| IMD gridded daily Tmax/Tmin | Primary: EVT and heatwave labels | Open download from IMD Pune; `imdlib` can automate it |
-| NASA POWER daily data | Supplementary: humidity, dew point, wind | Free API, no key needed |
-| ERA5-Land | Optional validation | Free Copernicus CDS account and API token |
+The date, maximum-temperature, and departure columns are required for the
+dashboard's training workflow. Optional weather columns are used only when
+present. Blank measurements are preserved as missing. The app rejects invalid
+dates, duplicate calendar dates, and non-numeric weather values.
 
-Raw data is not stored in this repository. Check each provider's current terms
-and attribution requirements before reusing or publishing results. Credentials
-stay in `.env` or `~/.cdsapirc` and are never committed.
+`departure_from_normal_c` must be computed before upload from a documented
+climatological reference appropriate to the data, location, and period. The
+current dashboard does not calculate a climatology, fetch reference normals,
+or create departure values. A NASA POWER historical series by itself does not
+automatically supply this project-specific departure field.
 
-## Methodology
+Check NASA POWER terms and attribution requirements before reuse or
+publication. No live data is retrieved by this application.
 
-**Extreme Value Theory.** Annual block maxima of daily Tmax are fitted with a
-Generalized Extreme Value distribution by maximum likelihood. Return levels are
-reported with confidence intervals (profile likelihood or bootstrap).
-Diagnostics include QQ/PP plots, return-level plots and a trend test on the
-maxima. SciPy's `genextreme` uses shape `c = -xi`, and the code handles this
-sign convention explicitly.
+## Windows setup
 
-**Heatwave labels.** An IMD-style proxy for a coastal station: a day exceeds a
-temperature floor and a day-of-year climatological threshold computed from the
-training period only, with a persistence rule. Exact thresholds are documented
-in `src/heatwave_labels.py` and checked against IMD's current criteria.
+Open PowerShell in the repository root (`heatwave-early-warning`). The current
+project environment has been exercised with Python 3.13.5; use a Python
+version compatible with the pinned packages in `requirements.txt`.
 
-**Machine learning.** Features use only information available at forecast issue
-time (lags, past-only rolling statistics, humidity, wind, calendar terms). The
-target is the heatwave label `h` days ahead (`h = 1` by default, configurable).
-Data is split chronologically into train, validation and test sets. Models:
-climatology baseline, persistence baseline, Logistic Regression, Random Forest.
-Metrics: precision, recall, F1, PR-AUC, ROC-AUC, confusion matrix and
-calibration. Accuracy alone is not used because heatwave days are rare.
+Create the virtual environment and install the pinned dependencies:
 
-**Warning logic.** Thresholds are chosen on validation data from the stated cost
-of a missed event versus a false alarm. The ML probability and the EVT
-return-period context are shown side by side and never merged into one
-probability, because they answer different questions and use the same
-underlying temperature evidence.
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
 
-## Roadmap
+To activate the environment in PowerShell:
 
-### Part 1: Data and Extreme Value Theory
-- [ ] Project configuration (`config/config.yaml`), logging, auto-created folders
-- [ ] Download and inspect IMD and NASA POWER data (`src/data_download.py`)
-- [ ] Clean and validate units, dates, missing values (`src/data_preprocessing.py`)
-- [ ] Exploratory analysis: time series, anomalies, seasonal cycle, trends
-- [ ] Block maxima, GEV fit, return levels with confidence intervals
-- [ ] Diagnostics and stationarity check (`src/evt_analysis.py`)
-- [ ] Unit tests for EVT functions
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
 
-### Part 2: Labels and Machine Learning
-- [ ] IMD-style proxy heatwave labels with class-balance report
-- [ ] Leakage-safe features with configurable forecast horizon
-- [ ] Temporal-leakage tests
-- [ ] Climatology and persistence baselines
-- [ ] Logistic Regression and Random Forest, chronological split
-- [ ] Evaluation: precision, recall, F1, PR-AUC, ROC-AUC, confusion matrix
-- [ ] Probability calibration and calibration curve
+If PowerShell's execution policy prevents activation, continue to use
+`.venv\Scripts\python.exe` directly in the commands below. `requirements.txt`
+pins the project's Python dependencies, including pandas, scikit-learn,
+Streamlit, and pytest.
 
-### Part 3: Warning System, Dashboard and Documentation
-- [ ] Cost-based warning thresholds chosen on validation data
-- [ ] Risk categories with contributing factors and general safety guidance
-- [ ] EVT context shown separately from the ML probability
-- [ ] Streamlit dashboard: temperature history, anomalies, return levels,
-      next-day probability, past events, model results and limitations
-- [ ] Dashboard works on a small sample dataset
-- [ ] Full test run, reproducibility check, deployment instructions
-- [ ] Architecture diagram, data-flow diagram, final report, presentation and
-      viva preparation
+## Launch the dashboard
+
+From the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app\streamlit_app.py
+```
+
+Upload a CSV matching the schema above. Confirm the explicit label thresholds,
+persistence, train fraction, lags, and rolling windows in the sidebar, then
+choose **Train and evaluate baseline**. After successful training, the
+historical validation results and eligible prediction dates are shown. Select
+a date and choose **Predict selected date** to run inference.
+
+Training metrics are for the chronological validation period, not future
+performance. Class `1` is shown as **Heatwave proxy warning**, not an official
+IMD warning.
+
+## Model workflow and metrics
+
+The current trainer:
+
+1. Builds proxy labels from daily Tmax and departure from normal.
+2. Builds predictors from prior calendar-day weather lags, past-only Tmax
+   rolling summaries, and target-date calendar features.
+3. Splits sorted observations chronologically, using 80% for training by
+   default and the later 20% for validation.
+4. Treats missing labels as unknown and excludes them rather than treating
+   them as negatives. A qualifying persistence run crossing the split is
+   censored as unknown on both sides.
+5. Fits median imputation and standardization only on training rows, followed
+   by class-balanced Logistic Regression.
+6. Reports precision, recall, F1, and a 2-by-2 confusion matrix. It also reports
+   train/validation date ranges and warns when validation contains fewer than
+   five positive cases by default.
+
+Precision, recall, and F1 can be unreliable when the validation period contains
+very few heatwave proxy positives. These scores are not model-performance
+claims for real Chennai data; no agreed real dataset has yet been evaluated
+here.
+
+For selected-date inference, supply historical observations plus one row for
+the target date. The target row must have a valid date; its weather values may
+be blank. The predictor uses the trained feature schema and past observations
+only. It rejects dates after the selected target date and requires sufficient
+preceding calendar coverage for the configured feature windows.
+
+**NASA POWER historical observations are not a live weather forecast.**
+Predictions based on them are research extrapolations from past data and
+calendar features. No numerical forecast feed is integrated.
+
+## Run tests
+
+From the repository root in PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -v
+```
+
+The tests use synthetic data to exercise labels, feature leakage and alignment,
+chronological training, and prediction interfaces. They do not validate model
+performance or the dashboard against a real NASA POWER CSV.
+
+## Limitations and remaining work
+
+- The real, agreed NASA POWER dataset has not been validated through the full
+  dashboard workflow.
+- The reference climatology and reproducible calculation of
+  `departure_from_normal_c` must be agreed and documented upstream.
+- The simplified label does not constitute an official IMD heatwave
+  declaration and omits spatial declaration requirements.
+- Rare positive labels and short validation periods can make metrics unstable.
+- Missing weather values are not fabricated, but the training pipeline uses
+  median imputation fitted only on the training partition. This is model
+  preprocessing, not modification of uploaded source data.
+- No live forecast, calibrated operational warning threshold, model persistence,
+  spatial warning layer, or production alert service is implemented.
+- EVT analysis and return levels remain separate planned research work; the
+  dashboard's uploaded-record temperature summaries are descriptive only.
 
 ## Project structure
 
-```
+```text
 heatwave-early-warning/
 ├── README.md
 ├── requirements.txt
-├── .env.example
-├── config/config.yaml
-├── data/{raw,processed}/
-├── notebooks/01_exploratory_analysis.ipynb
+├── config/
+│   └── config.yaml              # Reference defaults; not loaded by app
+├── app/
+│   └── streamlit_app.py
 ├── src/
-│   ├── data_download.py
-│   ├── data_preprocessing.py
-│   ├── feature_engineering.py
 │   ├── heatwave_labels.py
-│   ├── evt_analysis.py
+│   ├── feature_engineering.py
 │   ├── train_model.py
-│   ├── evaluate_model.py
 │   └── predict_warning.py
-├── app/streamlit_app.py
-├── models/
-├── outputs/{figures,tables}/
 └── tests/
+    ├── test_project.py
+    ├── test_feature_engineering.py
+    ├── test_train_model.py
+    └── test_predict_warning.py
 ```
 
-## Installation
-
-Requires Python 3.10 to 3.12.
-
-```bash
-git clone https://github.com/shannon-fernandes/heatwave-early-warning.git
-cd heatwave-early-warning
-python -m venv .venv
-source .venv/Scripts/activate      # Git Bash on Windows
-# macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-## Usage
-
-Planned run order. Each command is documented with its expected output once
-the script is built and tested.
-
-```bash
-python -m src.data_download
-python -m src.data_preprocessing
-python -m src.evt_analysis
-python -m src.heatwave_labels
-python -m src.train_model
-python -m src.evaluate_model
-streamlit run app/streamlit_app.py
-pytest
-```
-
-## Results
-
-Results will be added here only after the code that produces them has been run.
-Planned tables: GEV parameters with confidence intervals, return levels for 2,
-5, 10 and 20 years, a model comparison on the test period, and the number of
-heatwave days in each data split (very few events make scores unreliable).
-
-## Limitations
-
-- Gridded values are area averages and tend to understate local extremes, and
-  coastal cells mix land and sea
-- The proxy label is not an official IMD heatwave declaration
-- Heatwaves in Chennai are rare, so class imbalance and small test samples
-  limit how far the scores can be trusted
-- Only observed data is used; operational systems use numerical weather forecasts
-- GEV assumes stationarity, which is tested and not taken for granted
-- Long-period return levels are uncertain with a limited number of years
-
-## Future scope
-
-Non-stationary GEV, peaks-over-threshold (GPD) comparison, additional cities,
-numerical forecast inputs, spatial risk maps, ERA5-Land validation.
-
-## Literature search terms
-
-Search Google Scholar or Scopus, then read and cite real papers yourself:
-"heatwave India IMD criteria", "generalized extreme value temperature return
-level", "block maxima vs peaks over threshold", "heatwave prediction machine
-learning", "probability calibration rare events", "Chennai extreme temperature
-trend".
-
-## Data attribution
-
-Data comes from the India Meteorological Department, NASA POWER and, optionally,
-the Copernicus Climate Change Service. Each provider's required attribution
-wording is added here when its data is used in published results.
-
-## Team
-
-- Shannon Fernandes (GitHub: shannon-fernandes)
-- Teammates are added here when they join the repository.
-
-## License
-
-No license has been chosen yet, so all rights are reserved by default. A license
-will be added before the repository is made public. Data licenses are separate
-from code licenses.
+Other source modules are reserved for related project work and are not needed
+to launch the current dashboard workflow.
