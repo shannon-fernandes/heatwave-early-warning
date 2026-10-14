@@ -1,69 +1,85 @@
-"""Compute heatwave labels based on IMD criteria.
+"""Heatwave proxy labels for the dashboard/ML engine.
 
-Run: python -m src.heatwave_labels
-Input: data/processed/<city>_daily.csv
-Output: data/processed/<city>_daily_labeled.csv
+A simplified IMD-style coastal proxy, NOT an official IMD declaration: a day
+qualifies when Tmax >= a threshold AND departure from normal >= a threshold.
+A day is labelled positive when it sits in a run of at least
+``minimum_consecutive_days`` consecutive qualifying calendar days.
+
+Days with a missing Tmax or departure are UNKNOWN (``pd.NA``), never negative,
+and they break persistence runs, as do missing calendar days.
+
+(The config-driven batch pipeline version lives in ``pipeline_labels.py``.)
 """
-import logging
+from __future__ import annotations
+
+import math
+
 import numpy as np
 import pandas as pd
 
-from src.config import city_slug, get_path, load_config
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
+from src.validation import parse_daily_dates, require_numeric
 
 
-def compute_climatology(tmax: pd.Series, baseline_end_year: int) -> pd.Series:
-    """Compute mean Tmax per day-of-year using baseline training years."""
-    train = tmax[tmax.index.year <= baseline_end_year]
-    clim = train.groupby(train.index.dayofyear).mean().reindex(range(1, 367))
-    return clim.interpolate(limit_direction="both")
+def assign_heatwave_proxy_labels(
+    observations: pd.DataFrame,
+    *,
+    date_column: str = "date",
+    max_temperature_column: str = "max_temp_c",
+    departure_column: str = "departure_from_normal_c",
+    label_column: str = "heatwave_proxy",
+    max_temperature_threshold_c: float = 37.0,
+    departure_threshold_c: float = 4.5,
+    minimum_consecutive_days: int = 2,
+) -> pd.DataFrame:
+    """Return a copy of ``observations`` with a nullable boolean label column.
 
-
-def label_heatwaves(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
-    """Label days as heatwave (1) or not (0) using IMD criteria.
-    
-    For coastal stations like Chennai:
-    - Absolute threshold: Tmax >= 37°C
-    - Departure threshold: Tmax departure from normal >= 4.5°C
+    Row order and the original date column are preserved; the input is not modified.
     """
-    out = df.copy()
-    train_end = cfg["split"]["train_end_year"]
-    
-    # Compute baseline climatology
-    clim = compute_climatology(out["tmax"], train_end)
-    out["normal_tmax"] = clim.reindex(out.index.dayofyear).to_numpy()
-    out["tmax_departure"] = out["tmax"] - out["normal_tmax"]
-    
-    # IMD Coastal criteria
-    abs_threshold = 37.0 if cfg["study_area"]["region_type"] == "coastal" else 40.0
-    departure_threshold = 4.5
-    
-    hw_condition = (out["tmax"] >= abs_threshold) & (out["tmax_departure"] >= departure_threshold)
-    out["heatwave"] = hw_condition.astype(int)
-    
-    log.info("Labeled %d heatwave days out of %d total days (%.2f%%)", 
-             out["heatwave"].sum(), len(out), 100 * out["heatwave"].mean())
+    if not isinstance(observations, pd.DataFrame):
+        raise TypeError("observations must be a pandas DataFrame.")
+    if observations.empty:
+        raise ValueError("observations must contain at least one daily observation.")
+    for name, value in (("max_temperature_threshold_c", max_temperature_threshold_c),
+                        ("departure_threshold_c", departure_threshold_c)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{name} must be a finite number.")
+    if (isinstance(minimum_consecutive_days, bool) or not isinstance(minimum_consecutive_days, int)
+            or minimum_consecutive_days < 1):
+        raise ValueError("minimum_consecutive_days must be a positive integer.")
+
+    dates = parse_daily_dates(observations, date_column)
+    tmax = require_numeric(observations, max_temperature_column)
+    departure = require_numeric(observations, departure_column)
+
+    order = np.argsort(dates.to_numpy(), kind="stable")
+    d = dates.to_numpy()[order]
+    t = tmax.to_numpy()[order]
+    dep = departure.to_numpy()[order]
+
+    known = ~(np.isnan(t) | np.isnan(dep))
+    qualifying = known & (t >= max_temperature_threshold_c) & (dep >= departure_threshold_c)
+
+    positive = np.zeros(len(d), dtype=bool)
+    start = None
+    for i in range(len(d) + 1):
+        continues = (
+            i < len(d) and qualifying[i]
+            and (start is None or d[i] - d[i - 1] == np.timedelta64(1, "D"))
+        )
+        if continues:
+            if start is None:
+                start = i
+            continue
+        if start is not None:
+            if i - start >= minimum_consecutive_days:
+                positive[start:i] = True
+            start = None
+        if i < len(d) and qualifying[i]:  # a new run begins after a calendar gap
+            start = i
+
+    labels_sorted = np.where(known, positive, None)
+    labels = np.empty(len(d), dtype=object)
+    labels[order] = labels_sorted
+    out = observations.copy()
+    out[label_column] = pd.array(labels, dtype="boolean")
     return out
-
-
-def main() -> None:
-    cfg = load_config()
-    processed_dir = get_path(cfg, "processed_dir")
-    input_path = processed_dir / f"{city_slug(cfg)}_daily.csv"
-    
-    if not input_path.exists():
-        log.error("%s not found. Run `python -m src.data_preprocessing` first.", input_path)
-        raise SystemExit(1)
-        
-    df = pd.read_csv(input_path, index_col="date", parse_dates=True)
-    df_labeled = label_heatwaves(df, cfg)
-    
-    output_path = processed_dir / f"{city_slug(cfg)}_daily_labeled.csv"
-    df_labeled.to_csv(output_path)
-    log.info("Saved labeled daily data to %s", output_path)
-
-
-if __name__ == "__main__":
-    main()
