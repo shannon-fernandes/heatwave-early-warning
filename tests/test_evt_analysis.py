@@ -136,3 +136,75 @@ def test_loader_handles_dashes(tmp_path):
     p.write_text("Date,Rain,Temp Max,Temp Min\n01-01-1951,,29.0,20\n02-01-1951,,-----,20\n")
     s = evt.load_raw_tmax(str(p))
     assert s.iloc[0] == 29.0 and np.isnan(s.iloc[1])
+
+
+# ---------------------------------------------------------- additions (trend GEV, pipeline)
+def test_trend_gev_detects_location_trend_and_not_stationary_data():
+    yrs = np.arange(1951, 2021)
+    rng = np.random.default_rng(21)
+    trending = pd.Series(stats.genextreme.rvs(-0.1, 41 + 0.03 * (yrs - 1951), 1.0, random_state=rng), index=yrs)
+    flat = pd.Series(stats.genextreme.rvs(-0.1, 41, 1.0, size=len(yrs), random_state=rng), index=yrs)
+    t = evt.fit_gev_trend(trending)
+    assert t.p_value < 0.01 and t.slope_per_decade == pytest.approx(0.3, abs=0.2)
+    assert evt.fit_gev_trend(flat).p_value > 0.01
+
+
+def test_trend_return_level_rises_with_year_and_period():
+    f = evt.TrendGEVFit(xi=-0.1, loc0=41, loc_slope=0.03, scale=1.0, ref_year=1951, lr_stat=10, p_value=0.001)
+    assert evt.trend_return_level(f, 2020, 10) > evt.trend_return_level(f, 1951, 10)
+    assert evt.trend_return_level(f, 2000, 50) > evt.trend_return_level(f, 2000, 10)
+    with pytest.raises(ValueError):
+        evt.trend_return_level(f, 2000, 1)
+
+
+def test_trend_gev_needs_enough_years():
+    with pytest.raises(ValueError):
+        evt.fit_gev_trend(pd.Series(np.arange(10.0) + 40, index=np.arange(1990, 2000)))
+
+
+def test_restrict_years_and_processed_loader(tmp_path):
+    idx = pd.date_range("2018-01-01", "2022-12-31", name="date")
+    df = pd.DataFrame({"tmax": 30.0, "tmin": 20.0, "source": "x"}, index=idx)
+    df.loc["2019-05-05", "tmax"] = np.nan
+    p = tmp_path / "chennai_daily.csv"
+    df.to_csv(p)
+    s = evt.load_processed_tmax(str(p))
+    assert s.name == "tmax" and s.isna().sum() == 1
+    r = evt.restrict_years(s, start=2019, end=2020)
+    assert r.index.year.min() == 2019 and r.index.year.max() == 2020
+    with pytest.raises(KeyError):
+        evt.load_processed_tmax(str(p), column="nope")
+
+
+def test_run_analysis_writes_outputs(tmp_path, monkeypatch):
+    import src.config as config
+
+    monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
+    cfg = {
+        "study_area": {"name": "Testville"},
+        "analysis": {"homogeneous_end_year": 2030},
+        "paths": {"processed_dir": "p", "tables_dir": "t", "figures_dir": "f"},
+    }
+    for d in "ptf":
+        (tmp_path / d).mkdir()
+    s = _daily(70, seed=8, start=1951)
+    s.index.name = "date"
+    s.to_frame("tmax").to_csv(tmp_path / "p" / "testville_daily.csv")
+    out = evt.run_analysis(cfg, n_boot=30)
+    assert set(out) == {"primary", "full"}
+    assert (tmp_path / "t" / "gev_parameters.csv").exists()
+    assert (tmp_path / "t" / "gev_return_levels.csv").exists()
+    assert (tmp_path / "f" / "gev_return_levels.png").exists()
+    ci = pd.read_csv(tmp_path / "t" / "gev_return_levels.csv")
+    assert {2, 5, 10, 20, 50, 100} <= set(ci["T"])
+
+
+def test_run_analysis_missing_processed_file_message(tmp_path, monkeypatch):
+    import src.config as config
+
+    monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
+    (tmp_path / "p").mkdir()
+    cfg = {"study_area": {"name": "X"}, "analysis": {"homogeneous_end_year": 2020},
+           "paths": {"processed_dir": "p", "tables_dir": "t", "figures_dir": "f"}}
+    with pytest.raises(FileNotFoundError, match="data_preprocessing"):
+        evt.run_analysis(cfg)

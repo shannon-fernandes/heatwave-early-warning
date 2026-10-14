@@ -1,113 +1,84 @@
-"""Leakage-safe features and chronological splits.
+"""Leakage-safe weather predictors for the dashboard/ML engine.
 
-Run (after Person C's labels exist):  python -m src.feature_engineering
-Input:  data/processed/<city>_daily_labeled.csv  (needs a 0/1 column `heatwave`)
-Output: data/processed/<city>_features_h<horizon>.csv
+Predictors use only information available BEFORE the target date:
+calendar-day lags, past-only Tmax rolling mean/max, and calendar terms.
+Missing days or readings stay missing (nothing is fabricated); imputation, if
+any, happens later inside the model pipeline, fitted on training rows only.
+
+(The config-driven batch pipeline version lives in ``pipeline_features.py``.)
 """
-import logging
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-from src.config import city_slug, get_path, load_config
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
+from src.validation import parse_daily_dates, require_numeric
 
 
-def climatology_by_doy(tmax: pd.Series, train_end_year: int, smooth_days: int = 15) -> pd.Series:
-    """Smoothed mean Tmax per day of year (1..366), using TRAINING YEARS ONLY."""
-    train = tmax[tmax.index.year <= train_end_year]
-    clim = train.groupby(train.index.dayofyear).mean().reindex(range(1, 367))
-    clim = clim.interpolate(limit_direction="both")
-    ext = pd.concat([clim.iloc[-smooth_days:], clim, clim.iloc[:smooth_days]])  # wrap around the year
-    smooth = ext.rolling(smooth_days, center=True, min_periods=1).mean()
-    return smooth.iloc[smooth_days:-smooth_days]
+def _positive_ints(values: Sequence[int], name: str) -> tuple[int, ...]:
+    out = tuple(values)
+    if any(isinstance(v, bool) or not isinstance(v, (int, np.integer)) or v < 1 for v in out):
+        raise ValueError(f"{name} must contain positive integers.")
+    return tuple(int(v) for v in out)
 
 
-def build_features(df: pd.DataFrame, label_col: str, horizon: int, train_end_year: int,
-                   base_columns, lag_columns, lag_days, rolling_windows) -> pd.DataFrame:
-    """Return a table of features (known at the end of day t) plus `target`
-    (= label on day t + horizon). Rows with any missing value are dropped."""
-    if horizon < 1:
-        raise ValueError("horizon must be >= 1 for a forecast")
-    if not df.index.is_monotonic_increasing:
-        raise ValueError("index must be sorted by date")
-    steps = df.index.to_series().diff().dropna()
-    if not (steps == pd.Timedelta(days=1)).all():
-        raise ValueError("index must be a complete daily calendar (run preprocessing)")
-    needed = set(base_columns) | set(lag_columns) | {"tmax", "tmin", label_col}
-    missing = needed - set(df.columns)
-    if missing:
-        raise KeyError(f"Missing columns: {sorted(missing)}")
+def build_features(
+    observations: pd.DataFrame,
+    *,
+    date_column: str = "date",
+    max_temperature_column: str = "max_temp_c",
+    min_temperature_column: Optional[str] = "min_temp_c",
+    humidity_column: Optional[str] = "humidity",
+    wind_speed_column: Optional[str] = "wind_speed",
+    departure_column: Optional[str] = None,
+    lag_days: Sequence[int] = (1, 2, 3, 7),
+    rolling_windows: Sequence[int] = (3, 7),
+) -> pd.DataFrame:
+    """Return one predictor row per observation, sorted by date.
 
-    feat = pd.DataFrame(index=df.index)
-    for c in base_columns:
-        feat[c] = df[c]
-    feat["diurnal_range"] = df["tmax"] - df["tmin"]
-    for c in lag_columns:
-        for k in lag_days:
-            feat[f"{c}_lag{k}"] = df[c].shift(k)                 # shift(k>0) = past only
-    for w in rolling_windows:                                    # window ends at day t
-        feat[f"tmax_mean{w}"] = df["tmax"].rolling(w, min_periods=w).mean()
-        feat[f"tmax_max{w}"] = df["tmax"].rolling(w, min_periods=w).max()
+    The result keeps each source row's original index label and has the date as its
+    first column, so targets can be aligned by index. Optional weather columns are used
+    only when present. ``departure_column`` (default None = off) adds LAGGED departure-from-normal
+    predictors; only past days are used, never the target day. The input is not modified.
+    """
+    if not isinstance(observations, pd.DataFrame):
+        raise TypeError("observations must be a pandas DataFrame.")
+    if observations.empty:
+        raise ValueError("observations must contain at least one daily observation.")
+    lags = _positive_ints(lag_days, "lag_days")
+    windows = _positive_ints(rolling_windows, "rolling_windows")
 
-    clim = climatology_by_doy(df["tmax"], train_end_year)
-    anom = df["tmax"] - clim.reindex(df.index.dayofyear).to_numpy()
-    feat["tmax_anom"] = anom
-    feat["tmax_anom_mean3"] = anom.rolling(3, min_periods=3).mean()
+    dates = parse_daily_dates(observations, date_column)
+    weather = {max_temperature_column: require_numeric(observations, max_temperature_column)}
+    for column in (min_temperature_column, humidity_column, wind_speed_column):
+        if column is not None and column in observations.columns:
+            weather[column] = require_numeric(observations, column)
+    if departure_column is not None:                       # explicitly requested, so it must exist
+        weather[departure_column] = require_numeric(observations, departure_column)
 
-    doy = df.index.dayofyear
-    feat["doy_sin"] = np.sin(2 * np.pi * doy / 365.25)           # calendar is known in advance
-    feat["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
-    feat["label_today"] = df[label_col]                          # today's status, known at issue time
-    feat["target"] = df[label_col].shift(-horizon)               # the ONLY use of future data
+    order = np.argsort(dates.to_numpy(), kind="stable")
+    sorted_dates = pd.DatetimeIndex(dates.to_numpy()[order])
+    calendar = pd.date_range(sorted_dates[0], sorted_dates[-1], freq="D")
+    # Complete daily calendar: a missing day appears as NaN, so lags and windows count
+    # calendar days, not rows.
+    full = pd.DataFrame(
+        {name: pd.Series(values.to_numpy()[order], index=sorted_dates).reindex(calendar)
+         for name, values in weather.items()}
+    )
 
-    feat = feat.dropna()
-    feat["target"] = feat["target"].astype(int)
-    return feat
-
-
-def chronological_split(feat: pd.DataFrame, train_end_year: int, val_end_year: int, horizon: int):
-    """Train / validation / test by date, with a purge of `horizon` days at the end of
-    train and validation so no target date falls inside the next period."""
-    if not train_end_year < val_end_year:
-        raise ValueError("train_end_year must be before val_end_year")
-    train_end = pd.Timestamp(f"{train_end_year}-12-31")
-    val_end = pd.Timestamp(f"{val_end_year}-12-31")
-    gap = pd.Timedelta(days=horizon)
-    train = feat[feat.index <= train_end - gap]
-    val = feat[(feat.index > train_end) & (feat.index <= val_end - gap)]
-    test = feat[feat.index > val_end]
-    return train, val, test
-
-
-def build_features_from_config(df: pd.DataFrame, cfg: dict, label_col: str = "heatwave") -> pd.DataFrame:
-    f = cfg["features"]
-    return build_features(df, label_col, cfg["forecast"]["horizon_days"],
-                          cfg["split"]["train_end_year"], f["base_columns"],
-                          f["lag_columns"], f["lag_days"], f["rolling_windows"])
-
-
-def main() -> None:
-    cfg = load_config()
-    path = get_path(cfg, "processed_dir") / f"{city_slug(cfg)}_daily_labeled.csv"
-    if not path.exists():
-        log.error("%s not found. Please run heatwave_labels.py to create it first.", path)
-        raise SystemExit(1)
-    df = pd.read_csv(path, index_col="date", parse_dates=True)
-    a = cfg["analysis"]
-    df = df.loc[f"{a['ml_start_year']}-01-01":f"{a['ml_end_year']}-12-31"]   # POWER era, grid years only
-    h = cfg["forecast"]["horizon_days"]
-    feat = build_features_from_config(df, cfg)
-    out = get_path(cfg, "processed_dir") / f"{city_slug(cfg)}_features_h{h}.csv"
-    feat.to_csv(out)
-    log.info("Saved %d rows, %d features to %s", len(feat), feat.shape[1] - 1, out)
-    s = cfg["split"]
-    for name, part in zip(("train", "val", "test"),
-                          chronological_split(feat, s["train_end_year"], s["val_end_year"], h)):
-        log.info("%-5s rows=%d  heatwave targets=%d  (%.2f%%)", name, len(part),
-                 int(part["target"].sum()), 100 * part["target"].mean() if len(part) else 0)
-
-if __name__ == "__main__":
-    main()
+    features = pd.DataFrame(index=observations.index[order])
+    features[date_column] = sorted_dates.to_numpy()
+    for name in weather:
+        for k in lags:
+            features[f"{name}_lag_{k}"] = full[name].shift(k).reindex(sorted_dates).to_numpy()
+    past_tmax = full[max_temperature_column].shift(1)       # excludes the target day itself
+    for w in windows:
+        rolled = past_tmax.rolling(w, min_periods=w)
+        features[f"{max_temperature_column}_rolling_mean_{w}"] = rolled.mean().reindex(sorted_dates).to_numpy()
+        features[f"{max_temperature_column}_rolling_max_{w}"] = rolled.max().reindex(sorted_dates).to_numpy()
+    features["month"] = sorted_dates.month.to_numpy()
+    features["day_of_year"] = sorted_dates.dayofyear.to_numpy()
+    return features

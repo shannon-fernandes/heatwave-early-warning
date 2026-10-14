@@ -12,6 +12,8 @@ import streamlit as st
 
 from src.predict_warning import WarningPrediction, predict_warning
 from src.train_model import TrainingResult, train_baseline_model
+from src.warning_logic import risk_level
+from app.evt_panel import render_return_level_panel
 
 
 DATE_COLUMN = "date"
@@ -118,10 +120,10 @@ def _model_settings() -> dict[str, Any]:
         step=0.05,
     )
     max_threshold = st.sidebar.number_input(
-        "Proxy Tmax threshold (°C)", value=37.0, step=0.5
+        "Proxy Tmax threshold (°C)", value=38.0, step=0.5
     )
     departure_threshold = st.sidebar.number_input(
-        "Proxy departure threshold (°C)", value=4.5, step=0.5
+        "Proxy departure threshold (°C)", value=3.5, step=0.5
     )
     persistence_days = st.sidebar.number_input(
         "Consecutive qualifying days", min_value=1, max_value=10, value=2
@@ -158,6 +160,7 @@ def _model_settings() -> dict[str, Any]:
         "lag_days": lag_days,
         "rolling_windows": rolling_windows,
         "train_fraction": float(train_fraction),
+        "use_departure_features": True,
     }
 
 
@@ -482,6 +485,22 @@ def _render_prediction(
             "Predicted-class probability",
             f"{prediction.predicted_class_probability:.1%}",
         )
+    if (
+        prediction.positive_class_probability is not None
+        and result.decision_threshold is not None
+    ):
+        level = risk_level(prediction.positive_class_probability, result.decision_threshold)
+        st.metric("Risk level (research proxy)", level)
+        st.caption(
+            f"Probability of a heatwave-proxy day: {prediction.positive_class_probability:.1%}. "
+            f"Warning threshold {result.decision_threshold:.1%}, chosen to minimise cost "
+            "(a missed event counted as 10 false alarms) on the first half of the validation "
+            "period. The cost ratio is an assumption."
+        )
+    if prediction.contributing_factors:
+        st.markdown("**Main drivers of this probability** (larger = pushes towards a warning)")
+        for name, value in prediction.contributing_factors:
+            st.markdown(f"- `{name}`: {value:+.2f}")
     st.caption(
         "This is a research proxy result, not an official IMD declaration or "
         "a live forecast. Follow IMD and local authorities for real alerts."
@@ -598,6 +617,9 @@ def main() -> None:
 
     st.divider()
     _render_history(dataset)
+
+    st.divider()
+    render_return_level_panel(dataset)
 
     st.divider()
     result = _training_result(dataset, settings)
