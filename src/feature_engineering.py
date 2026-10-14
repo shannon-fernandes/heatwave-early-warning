@@ -1,231 +1,113 @@
-"""Leakage-safe predictor construction for daily heatwave observations."""
+"""Leakage-safe features and chronological splits.
 
-from __future__ import annotations
+Run (after Person C's labels exist):  python -m src.feature_engineering
+Input:  data/processed/<city>_daily_labeled.csv  (needs a 0/1 column `heatwave`)
+Output: data/processed/<city>_features_h<horizon>.csv
+"""
+import logging
 
-from collections.abc import Sequence
-from typing import Optional
-
+import numpy as np
 import pandas as pd
 
+from src.config import city_slug, get_path, load_config
 
-def build_features(
-    observations: pd.DataFrame,
-    *,
-    date_column: str = "date",
-    max_temperature_column: str = "max_temp_c",
-    min_temperature_column: Optional[str] = "min_temp_c",
-    humidity_column: Optional[str] = "humidity",
-    wind_speed_column: Optional[str] = "wind_speed",
-    lag_days: Sequence[int] = (1, 2, 3, 7),
-    rolling_windows: Sequence[int] = (3, 7),
-) -> pd.DataFrame:
-    """Build date-aligned, past-only predictors from daily weather observations.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
-    Required columns are the date and daily maximum temperature. Minimum
-    temperature, humidity, and wind speed are included when their configured
-    columns are present; pass ``None`` for an optional column to disable it.
-    All weather columns are numeric and used as potential lag predictors.
 
-    Lags are exact prior calendar days: ``max_temp_c_lag_1`` is Tmax from the
-    previous calendar day, and it is missing if that day's observation is
-    absent. Rolling mean and maximum features use the preceding calendar-day
-    window, excluding the target date, and are emitted only when every day in
-    that window has a non-missing Tmax. Missing dates and measurements are not
-    filled or imputed.
+def climatology_by_doy(tmax: pd.Series, train_end_year: int, smooth_days: int = 15) -> pd.Series:
+    """Smoothed mean Tmax per day of year (1..366), using TRAINING YEARS ONLY."""
+    train = tmax[tmax.index.year <= train_end_year]
+    clim = train.groupby(train.index.dayofyear).mean().reindex(range(1, 367))
+    clim = clim.interpolate(limit_direction="both")
+    ext = pd.concat([clim.iloc[-smooth_days:], clim, clim.iloc[:smooth_days]])  # wrap around the year
+    smooth = ext.rolling(smooth_days, center=True, min_periods=1).mean()
+    return smooth.iloc[smooth_days:-smooth_days]
 
-    The result contains only the normalized date column and engineered
-    predictors. It intentionally excludes all other input columns, including
-    target labels, so targets remain separate. Rows are sorted chronologically
-    and retain their original index labels; the date column and index together
-    provide a stable mapping back to source observations.
 
-    Calendar features ``month`` and ``day_of_year`` use the target row's date,
-    which is known at prediction time. Weather lags and rolling statistics do
-    not use target-day weather observations.
+def build_features(df: pd.DataFrame, label_col: str, horizon: int, train_end_year: int,
+                   base_columns, lag_columns, lag_days, rolling_windows) -> pd.DataFrame:
+    """Return a table of features (known at the end of day t) plus `target`
+    (= label on day t + horizon). Rows with any missing value are dropped."""
+    if horizon < 1:
+        raise ValueError("horizon must be >= 1 for a forecast")
+    if not df.index.is_monotonic_increasing:
+        raise ValueError("index must be sorted by date")
+    steps = df.index.to_series().diff().dropna()
+    if not (steps == pd.Timedelta(days=1)).all():
+        raise ValueError("index must be a complete daily calendar (run preprocessing)")
+    needed = set(base_columns) | set(lag_columns) | {"tmax", "tmin", label_col}
+    missing = needed - set(df.columns)
+    if missing:
+        raise KeyError(f"Missing columns: {sorted(missing)}")
 
-    Args:
-        observations: Daily weather observations.
-        date_column: Name of the required date column.
-        max_temperature_column: Name of the required maximum-temperature
-            column.
-        min_temperature_column: Optional minimum-temperature column name.
-        humidity_column: Optional humidity column name.
-        wind_speed_column: Optional wind-speed column name.
-        lag_days: Positive calendar-day offsets for lagged weather predictors.
-            Values must be unique positive integers.
-        rolling_windows: Positive calendar-day window sizes for maximum-
-            temperature rolling mean and rolling maximum. Values must be
-            unique positive integers.
+    feat = pd.DataFrame(index=df.index)
+    for c in base_columns:
+        feat[c] = df[c]
+    feat["diurnal_range"] = df["tmax"] - df["tmin"]
+    for c in lag_columns:
+        for k in lag_days:
+            feat[f"{c}_lag{k}"] = df[c].shift(k)                 # shift(k>0) = past only
+    for w in rolling_windows:                                    # window ends at day t
+        feat[f"tmax_mean{w}"] = df["tmax"].rolling(w, min_periods=w).mean()
+        feat[f"tmax_max{w}"] = df["tmax"].rolling(w, min_periods=w).max()
 
-    Returns:
-        A new DataFrame sorted by date, with normalized dates, generated
-        predictor columns, and the source DataFrame's index preserved.
+    clim = climatology_by_doy(df["tmax"], train_end_year)
+    anom = df["tmax"] - clim.reindex(df.index.dayofyear).to_numpy()
+    feat["tmax_anom"] = anom
+    feat["tmax_anom_mean3"] = anom.rolling(3, min_periods=3).mean()
 
-    Raises:
-        TypeError: If ``observations`` is not a pandas DataFrame.
-        ValueError: If required columns are missing, dates are invalid or
-            duplicated by calendar day, a used weather column is non-numeric,
-            a configured column name is invalid, or a lag/window is invalid.
-    """
-    if not isinstance(observations, pd.DataFrame):
-        raise TypeError("observations must be a pandas DataFrame.")
-    if observations.empty:
-        raise ValueError("observations must contain at least one daily observation.")
+    doy = df.index.dayofyear
+    feat["doy_sin"] = np.sin(2 * np.pi * doy / 365.25)           # calendar is known in advance
+    feat["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
+    feat["label_today"] = df[label_col]                          # today's status, known at issue time
+    feat["target"] = df[label_col].shift(-horizon)               # the ONLY use of future data
 
-    configured_columns = {
-        "date_column": date_column,
-        "max_temperature_column": max_temperature_column,
-        "min_temperature_column": min_temperature_column,
-        "humidity_column": humidity_column,
-        "wind_speed_column": wind_speed_column,
-    }
-    for argument, name in configured_columns.items():
-        if name is not None and (not isinstance(name, str) or not name):
-            raise ValueError(f"{argument} must be a non-empty string or None.")
-    if not isinstance(date_column, str) or not date_column:
-        raise ValueError("date_column must be a non-empty string.")
-    if not isinstance(max_temperature_column, str) or not max_temperature_column:
-        raise ValueError("max_temperature_column must be a non-empty string.")
+    feat = feat.dropna()
+    feat["target"] = feat["target"].astype(int)
+    return feat
 
-    if min_temperature_column is not None and min_temperature_column == max_temperature_column:
-        raise ValueError("Minimum- and maximum-temperature columns must be distinct.")
-    optional_columns = (
-        min_temperature_column,
-        humidity_column,
-        wind_speed_column,
-    )
-    selected_optional_columns = [
-        name
-        for name in optional_columns
-        if name is not None and name in observations.columns
-    ]
-    selected_weather_columns = [max_temperature_column, *selected_optional_columns]
-    if len(set(selected_weather_columns)) != len(selected_weather_columns):
-        raise ValueError("Configured weather column names must be distinct.")
-    if date_column in selected_weather_columns:
-        raise ValueError("date_column must differ from configured weather columns.")
 
-    missing_columns = [
-        name
-        for name in (date_column, max_temperature_column)
-        if name not in observations.columns
-    ]
-    if missing_columns:
-        raise ValueError(f"Missing required column(s): {', '.join(missing_columns)}.")
+def chronological_split(feat: pd.DataFrame, train_end_year: int, val_end_year: int, horizon: int):
+    """Train / validation / test by date, with a purge of `horizon` days at the end of
+    train and validation so no target date falls inside the next period."""
+    if not train_end_year < val_end_year:
+        raise ValueError("train_end_year must be before val_end_year")
+    train_end = pd.Timestamp(f"{train_end_year}-12-31")
+    val_end = pd.Timestamp(f"{val_end_year}-12-31")
+    gap = pd.Timedelta(days=horizon)
+    train = feat[feat.index <= train_end - gap]
+    val = feat[(feat.index > train_end) & (feat.index <= val_end - gap)]
+    test = feat[feat.index > val_end]
+    return train, val, test
 
-    def validate_periods(periods: Sequence[int], argument: str) -> list[int]:
-        if isinstance(periods, (str, bytes)):
-            raise ValueError(f"{argument} must be a sequence of positive integers.")
-        try:
-            values = list(periods)
-        except TypeError as exc:
-            raise ValueError(
-                f"{argument} must be a sequence of positive integers."
-            ) from exc
-        if any(
-            isinstance(value, bool) or not isinstance(value, int) or value < 1
-            for value in values
-        ):
-            raise ValueError(f"{argument} must contain only positive integers.")
-        if len(set(values)) != len(values):
-            raise ValueError(f"{argument} must not contain duplicate values.")
-        return values
 
-    lags = validate_periods(lag_days, "lag_days")
-    windows = validate_periods(rolling_windows, "rolling_windows")
-    feature_names = [date_column, "month", "day_of_year"]
-    for column in selected_weather_columns:
-        feature_names.extend(f"{column}_lag_{lag}" for lag in lags)
-    for window in windows:
-        feature_names.extend(
-            (
-                f"{max_temperature_column}_rolling_mean_{window}",
-                f"{max_temperature_column}_rolling_max_{window}",
-            )
-        )
-    if len(set(feature_names)) != len(feature_names):
-        raise ValueError("Configured column names conflict with generated feature names.")
+def build_features_from_config(df: pd.DataFrame, cfg: dict, label_col: str = "heatwave") -> pd.DataFrame:
+    f = cfg["features"]
+    return build_features(df, label_col, cfg["forecast"]["horizon_days"],
+                          cfg["split"]["train_end_year"], f["base_columns"],
+                          f["lag_columns"], f["lag_days"], f["rolling_windows"])
 
-    try:
-        parsed_dates = pd.to_datetime(
-            observations[date_column],
-            errors="coerce",
-            format="mixed",
-        )
-        calendar_dates = parsed_dates.dt.normalize()
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise ValueError(
-            f"Column {date_column!r} must contain consistently parseable dates."
-        ) from exc
 
-    invalid_dates = parsed_dates.isna()
-    if invalid_dates.any():
-        invalid_rows = observations.index[invalid_dates].tolist()[:5]
-        raise ValueError(
-            f"Column {date_column!r} contains invalid or missing dates "
-            f"at row index(es): {invalid_rows}."
-        )
-    duplicate_dates = calendar_dates.duplicated(keep=False)
-    if duplicate_dates.any():
-        duplicate_values = (
-            calendar_dates.loc[duplicate_dates].drop_duplicates().astype(str).tolist()[:5]
-        )
-        raise ValueError(
-            f"Duplicate daily dates in column {date_column!r}: {duplicate_values}."
-        )
+def main() -> None:
+    cfg = load_config()
+    path = get_path(cfg, "processed_dir") / f"{city_slug(cfg)}_daily_labeled.csv"
+    if not path.exists():
+        log.error("%s not found. Please run heatwave_labels.py to create it first.", path)
+        raise SystemExit(1)
+    df = pd.read_csv(path, index_col="date", parse_dates=True)
+    a = cfg["analysis"]
+    df = df.loc[f"{a['ml_start_year']}-01-01":f"{a['ml_end_year']}-12-31"]   # POWER era, grid years only
+    h = cfg["forecast"]["horizon_days"]
+    feat = build_features_from_config(df, cfg)
+    out = get_path(cfg, "processed_dir") / f"{city_slug(cfg)}_features_h{h}.csv"
+    feat.to_csv(out)
+    log.info("Saved %d rows, %d features to %s", len(feat), feat.shape[1] - 1, out)
+    s = cfg["split"]
+    for name, part in zip(("train", "val", "test"),
+                          chronological_split(feat, s["train_end_year"], s["val_end_year"], h)):
+        log.info("%-5s rows=%d  heatwave targets=%d  (%.2f%%)", name, len(part),
+                 int(part["target"].sum()), 100 * part["target"].mean() if len(part) else 0)
 
-    source = observations.copy()
-    source[date_column] = calendar_dates
-    source = source.sort_values(date_column, kind="stable")
-
-    observed_dates = pd.DatetimeIndex(source[date_column])
-    calendar = pd.date_range(
-        start=observed_dates.min(),
-        end=observed_dates.max(),
-        freq="D",
-    )
-
-    weather: dict[str, pd.Series] = {}
-    for column in selected_weather_columns:
-        try:
-            values = pd.to_numeric(source[column], errors="raise")
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Weather column {column!r} must contain numeric values or missing values."
-            ) from exc
-        if values.dropna().isin([float("inf"), float("-inf")]).any():
-            raise ValueError(f"Weather column {column!r} contains a non-finite value.")
-        weather[column] = pd.Series(
-            values.to_numpy(),
-            index=observed_dates,
-        ).reindex(calendar)
-
-    features = pd.DataFrame(index=source.index)
-    features[date_column] = observed_dates.to_numpy()
-
-    for column, values in weather.items():
-        for lag in lags:
-            lagged = values.shift(lag).reindex(observed_dates)
-            features[f"{column}_lag_{lag}"] = lagged.to_numpy()
-
-    maximum = weather[max_temperature_column]
-    past_maximum = maximum.shift(1)
-    for window in windows:
-        rolling_mean = past_maximum.rolling(
-            window=window,
-            min_periods=window,
-        ).mean().reindex(observed_dates)
-        rolling_maximum = past_maximum.rolling(
-            window=window,
-            min_periods=window,
-        ).max().reindex(observed_dates)
-        features[f"{max_temperature_column}_rolling_mean_{window}"] = (
-            rolling_mean.to_numpy()
-        )
-        features[f"{max_temperature_column}_rolling_max_{window}"] = (
-            rolling_maximum.to_numpy()
-        )
-
-    features["month"] = source[date_column].dt.month
-    features["day_of_year"] = source[date_column].dt.dayofyear
-    return features
+if __name__ == "__main__":
+    main()
