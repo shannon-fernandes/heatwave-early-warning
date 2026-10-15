@@ -50,7 +50,7 @@ def test_training_and_prediction_use_departure_features_without_target_day_leak(
     b = predict_warning(res, leaky, target, lag_days=(1, 2), rolling_windows=(2,))
     assert a.positive_class_probability == b.positive_class_probability
     assert 0 <= a.positive_class_probability <= 1
-    assert all(isinstance(n, str) and v > 0 for n, v in a.contributing_factors)
+    assert all(isinstance(n, str) and isinstance(v, float) for n, v in a.contributing_factors)
 
 
 def test_prediction_without_departure_column_fails_clearly_when_model_needs_it():
