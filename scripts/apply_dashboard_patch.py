@@ -51,6 +51,9 @@ PATCHES = [
     ("default departure",
      '        "Proxy departure threshold (°C)", value=4.5, step=0.5\n',
      '        "Proxy departure threshold (°C)", value=3.5, step=0.5\n'),
+    ("latest date first",
+     "        options=dates,\n",
+     "        options=dates,\n        index=len(dates) - 1,\n"),
     ("departure features",
      '        "train_fraction": float(train_fraction),\n    }\n',
      '        "train_fraction": float(train_fraction),\n        "use_departure_features": True,\n    }\n'),
@@ -62,20 +65,24 @@ def main() -> int:
         print(f"{PATH} not found. Run this from the repository root.")
         return 1
     text = PATH.read_text(encoding="utf-8")
-    if "render_return_level_panel" in text:
-        print("Already patched. Nothing to do.")
-        return 0
-    for name, old, _ in PATCHES:
+    todo = []
+    for name, old, new in PATCHES:
+        if new in text:                      # already applied (safe to run again)
+            continue
         n = text.count(old)
         if n != 1:
             print(f"Cannot patch: anchor '{name}' found {n} times (expected 1). Nothing was changed.")
             print("Apply the change by hand: see scripts/apply_dashboard_patch.py for the exact text.")
             return 1
+        todo.append((name, old, new))
+    if not todo:
+        print("Already fully patched. Nothing to do.")
+        return 0
     Path(str(PATH) + ".bak").write_text(text, encoding="utf-8")
-    for _, old, new in PATCHES:
+    for _, old, new in todo:
         text = text.replace(old, new)
     PATH.write_text(text, encoding="utf-8")
-    print("Patched app/streamlit_app.py (backup: app/streamlit_app.py.bak).")
+    print("Applied: " + ", ".join(n for n, _, _ in todo) + " (backup: app/streamlit_app.py.bak).")
     return 0
 
 

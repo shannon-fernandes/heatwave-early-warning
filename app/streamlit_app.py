@@ -424,6 +424,7 @@ def _render_prediction(
     target = st.selectbox(
         "Prediction date",
         options=dates,
+        index=len(dates) - 1,
         format_func=lambda value: value.strftime("%Y-%m-%d"),
         key="prediction_target_date",
     )

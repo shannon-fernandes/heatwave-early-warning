@@ -17,6 +17,7 @@ Design (small number of events, so be careful):
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -81,16 +82,23 @@ def evaluate_label(frame: pd.DataFrame, name: str, spec: dict, n_boot: int = 300
 
 
 def main() -> None:
+    import argparse
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    ap = argparse.ArgumentParser(description="Evaluate the model against baselines.")
+    ap.add_argument("--input", help="dashboard CSV (default data/processed/<city>_dashboard.csv)")
+    ap.add_argument("--tag", default="", help="suffix for output file names, e.g. live")
+    args = ap.parse_args()
     cfg = load_config()
-    path = get_path(cfg, "processed_dir") / f"{city_slug(cfg)}_dashboard.csv"
+    path = Path(args.input) if args.input else get_path(cfg, "processed_dir") / f"{city_slug(cfg)}_dashboard.csv"
+    suffix = f"_{args.tag}" if args.tag else ""
     if not path.exists():
         raise SystemExit(f"{path} not found. Run `python -m src.export_dashboard_csv` first.")
     frame = pd.read_csv(path, parse_dates=["date"])
     tables, figures = get_path(cfg, "tables_dir"), get_path(cfg, "figures_dir")
 
     counts = pd.concat([label_counts(frame, n, s) for n, s in LABEL_SPECS.items()])
-    counts.to_csv(tables / "label_counts.csv", index=False)
+    counts.to_csv(tables / f"label_counts{suffix}.csv", index=False)
     log.info("Events per split:\n%s", counts[["label", "split", "days", "unknown", "positive_days"]].to_string(index=False))
 
     for name, spec in LABEL_SPECS.items():
@@ -99,10 +107,10 @@ def main() -> None:
         except ValueError as exc:
             log.warning("%s: cannot train/evaluate (%s)", name, exc)
             continue
-        out["table"].to_csv(tables / f"model_comparison_{name}.csv", index=False)
-        out["calibration"].to_csv(tables / f"calibration_{name}.csv", index=False)
-        ev.plot_calibration({name: out["calibration"]}, figures / f"calibration_{name}.png")
-        ev.plot_pr_curves(out["y_hold"], out["probs_hold"], figures / f"pr_curve_{name}.png")
+        out["table"].to_csv(tables / f"model_comparison_{name}{suffix}.csv", index=False)
+        out["calibration"].to_csv(tables / f"calibration_{name}{suffix}.csv", index=False)
+        ev.plot_calibration({name: out["calibration"]}, figures / f"calibration_{name}{suffix}.png")
+        ev.plot_pr_curves(out["y_hold"], out["probs_hold"], figures / f"pr_curve_{name}{suffix}.png")
         log.info("%s: thresholds chosen on %s to %s, scored on holdout %s to %s",
                  name, out["validation_start"].date(), out["calibration_end"].date(),
                  out["holdout_start"].date(), out["validation_end"].date())

@@ -32,8 +32,8 @@ def _contributing_factors(model, model_input: pd.DataFrame, top: int = 5) -> tup
         return ()
     z = steps["scaler"].transform(steps["imputer"].transform(model_input))[0]
     contribution = coef[0] * z
-    order = np.argsort(-contribution)[:top]
-    return tuple((str(model_input.columns[i]), float(contribution[i])) for i in order if contribution[i] > 0)
+    order = np.argsort(-np.abs(contribution))[:top]          # largest effects in either direction
+    return tuple((str(model_input.columns[i]), float(contribution[i])) for i in order)
 
 
 def predict_warning(training_result: TrainingResult, observations: pd.DataFrame,
